@@ -34,5 +34,8 @@
     <None Include="shaders\shader.vert">
       <Filter>Source Files</Filter>
     </None>
+    <None Include="shaders\shader1.vert">
+      <Filter>Source Files</Filter>
+    </None>
   </ItemGroup>
 </Project>
