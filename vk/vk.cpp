@@ -15,9 +15,16 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 
+#define TINYOBJLOADER_IMPLEMENTATION
+#include <tiny_obj_loader.h>
+
+#define GLM_ENABLE_EXPERIMENTAL
+#include <glm/gtx/hash.hpp>
+
 #include <iostream>
 #include <vector>
 #include <array>
+#include <unordered_map>
 #include <set>
 #include <stdexcept>
 #include <functional>
@@ -62,9 +69,23 @@ struct Vertex {
 
 		return attributeDescriptions;
 	}
+
+	bool operator==(const Vertex& other) const {
+		return pos == other.pos && color == other.color && texCoord == other.texCoord;
+	}
 };
 
-const std::vector<Vertex> vertices = {
+namespace std {
+	template<> struct hash<Vertex> {
+		size_t operator()(Vertex const& vertex) const {
+			return ((hash<glm::vec3>()(vertex.pos) ^
+				(hash<glm::vec3>()(vertex.color) << 1)) >> 1) ^
+				(hash<glm::vec2>()(vertex.texCoord) << 1);
+		}
+	};
+}
+
+const std::vector<Vertex> planeVertices = {
 	{{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
 	{{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
 	{{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
@@ -76,7 +97,7 @@ const std::vector<Vertex> vertices = {
 	{{-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}
 };
 
-const std::vector<uint16_t> indices = {
+const std::vector<uint32_t> planeIndices = {
 	0, 1, 2, 2, 3, 0,
 	4, 5, 6, 6, 7, 4
 };
@@ -99,6 +120,9 @@ public:
 private:
 	const int WIDTH = 1280;
 	const int HEIGHT = 720;
+
+	const std::string VIKING_MODEL_PATH = "models/viking_room.obj";
+	const std::string VIKING_TEXTURE_PATH = "textures/viking_room.png";
 
 	const int MAX_FRAMES_IN_FLIGHT = 2;
 
@@ -151,7 +175,7 @@ private:
 	VkExtent2D swapChainExtent;
 	VkFormat swapChainImageFormat;
 
-	VkRenderPass renderPass;
+	VkRenderPass mainRenderPass;
 	VkDescriptorPool descriptorPool;
 	std::vector<VkDescriptorSet> descriptorSets;
 	VkDescriptorSetLayout descriptorSetLayout;
@@ -172,6 +196,8 @@ private:
 
 	bool framebufferResized = false;
 
+	std::vector<Vertex> vertices;
+	std::vector<uint32_t> indices;
 	VkBuffer vertexBuffer;
 	VkDeviceMemory vertexBufferMemory;
 	VkBuffer indexBuffer;
@@ -323,15 +349,16 @@ private:
 		createLogicalDevice();
 		createSwapChain();
 		createSwapChainImageViews();
-		createRenderPass();
+		createRenderPass(mainRenderPass, swapChainImageFormat);
 		createDescriptorSetLayout();
 		createGraphicsPipeline();
 		createCommandPool();
 		createDepthResources();
 		createFramebuffers();
-		createTextureImage();
+		createTextureImage(VIKING_TEXTURE_PATH);
 		createTextureImageView();
-		createTextureSampler();
+		createTextureSampler(textureSampler, 16.0f);
+		loadModel();
 		createVertexBuffer(); // note vertex and index buffers should be stored in a single VkBuffer for better memory efficiency
 		createIndexBuffer();
 		createUniformBuffers();
@@ -381,7 +408,7 @@ private:
 		return format == VK_FORMAT_D32_SFLOAT_S8_UINT || format == VK_FORMAT_D24_UNORM_S8_UINT;
 	}
 
-	void createTextureSampler()
+	void createTextureSampler(VkSampler &texSampler, float anistropicFiltering)
 	{
 		VkSamplerCreateInfo samplerInfo = {};
 		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -393,7 +420,7 @@ private:
 		samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
 		// set to a lot of anisotropic filtering
 		samplerInfo.anisotropyEnable = VK_TRUE;
-		samplerInfo.maxAnisotropy = 16.0f;
+		samplerInfo.maxAnisotropy = anistropicFiltering;
 		samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK; // note: arbitrary color cannot be specified
 		samplerInfo.unnormalizedCoordinates = VK_FALSE; // false is 0 to 1 (ie: sensible usage), true maps to the texel size
 		// these values are used in filtering like doing PCF for shadow maps
@@ -405,7 +432,7 @@ private:
 		samplerInfo.minLod = 0.0f;
 		samplerInfo.maxLod = 0.0f;
 
-		if (vkCreateSampler(device, &samplerInfo, nullptr, &textureSampler) != VK_SUCCESS) {
+		if (vkCreateSampler(device, &samplerInfo, nullptr, &texSampler) != VK_SUCCESS) {
 			throw std::runtime_error("failed to create texture sampler!");
 		}
 	}
@@ -441,10 +468,10 @@ private:
 		textureImageView = createImageView(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT);
 	}
 
-	void createTextureImage()
+	void createTextureImage(std::string texturePath)
 	{
 		int texWidth, texHeight, texChannels;
-		stbi_uc* pixels = stbi_load("textures/IMG_3826.PNG", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+		stbi_uc* pixels = stbi_load(texturePath.c_str(), &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
 		VkDeviceSize imageSize = texWidth * texHeight * 4;
 
 		if (!pixels) {
@@ -563,6 +590,12 @@ private:
 
 			sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
 			destinationStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+		} else if (newLayout == VK_IMAGE_LAYOUT_GENERAL) {
+			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+			barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+
+			sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT; // means earliest in the graphics pipeline
+			destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 		} else {
 			throw std::invalid_argument("unsupported layout transition!");
 		}
@@ -575,7 +608,7 @@ private:
 	void copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width, uint32_t height) {
 		VkCommandBuffer commandBuffer = beginSingleTimeCommandBufferCommands();
 
-		VkBufferImageCopy region{};
+		VkBufferImageCopy region = {};
 		region.bufferOffset = 0;
 		region.bufferRowLength = 0;
 		region.bufferImageHeight = 0;
@@ -644,6 +677,48 @@ private:
 		}
 
 
+	}
+
+	void loadModel()
+	{
+		tinyobj::attrib_t attrib;
+		std::vector<tinyobj::shape_t> shapes;
+		std::vector<tinyobj::material_t> materials;
+		std::string warn, err;
+
+		if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, VIKING_MODEL_PATH.c_str())) {
+			throw std::runtime_error(warn + err);
+		}
+
+		std::unordered_map<Vertex, uint32_t> seenVerts = {};
+
+		for (const auto& shape : shapes) {
+			for (const auto& index : shape.mesh.indices) {
+				Vertex vertex = {};
+
+				vertex.pos = {
+					attrib.vertices[3 * index.vertex_index + 0],
+					attrib.vertices[3 * index.vertex_index + 1],
+					attrib.vertices[3 * index.vertex_index + 2]
+				};
+
+				vertex.texCoord = {
+					attrib.texcoords[2 * index.texcoord_index + 0],
+					1.0f - attrib.texcoords[2 * index.texcoord_index + 1]
+				};
+
+				vertex.color = { 0.0f, 0.0f, 0.0f };
+
+				if (!seenVerts.count(vertex))
+				{
+					seenVerts.insert(std::make_pair(vertex, (uint32_t)vertices.size())); // vertices.size() is used to count the vertices as they come in
+					//seenVerts[vertex] = (uint32_t)vertices.size();
+					vertices.push_back(vertex);
+				} 
+
+				indices.push_back(seenVerts[vertex]);
+			}
+		}
 	}
 
 	void createDescriptorPool()
@@ -849,7 +924,7 @@ private:
 
 		createSwapChain();
 		createSwapChainImageViews();
-		createRenderPass();
+		createRenderPass(mainRenderPass, swapChainImageFormat);
 		createGraphicsPipeline();
 		createDepthResources();
 		createFramebuffers();
@@ -909,7 +984,7 @@ private:
 			//-------------- BEGIN THE RENDER PASS --------------
 			VkRenderPassBeginInfo renderPassInfo = {};
 			renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-			renderPassInfo.renderPass = renderPass;
+			renderPassInfo.renderPass = mainRenderPass;
 			renderPassInfo.framebuffer = swapChainFramebuffers[i];
 			renderPassInfo.renderArea.offset = { 0, 0 };
 			renderPassInfo.renderArea.extent = swapChainExtent;
@@ -929,7 +1004,7 @@ private:
 			VkDeviceSize offsets[] = { 0 };
 			vkCmdBindVertexBuffers(commandBuffers[i], 0, 1, vertexBuffers, offsets);
 
-			vkCmdBindIndexBuffer(commandBuffers[i], indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+			vkCmdBindIndexBuffer(commandBuffers[i], indexBuffer, 0, VK_INDEX_TYPE_UINT32);
 
 			vkCmdBindDescriptorSets(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSets[i], 0, nullptr); // need to bind descriptor set before drawing
 
@@ -969,7 +1044,7 @@ private:
 
 			VkFramebufferCreateInfo framebufferInfo = {};
 			framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-			framebufferInfo.renderPass = renderPass;
+			framebufferInfo.renderPass = mainRenderPass;
 			framebufferInfo.attachmentCount = (uint32_t)attachments.size();
 			framebufferInfo.pAttachments = attachments.data();
 			framebufferInfo.width = swapChainExtent.width;
@@ -982,11 +1057,11 @@ private:
 		}
 	}
 
-	void createRenderPass() {
+	void createRenderPass(VkRenderPass &renderPass, VkFormat imageFormat) {
 
 		// own lone color buffer
 		VkAttachmentDescription colorAttachment = {};
-		colorAttachment.format = swapChainImageFormat;
+		colorAttachment.format = imageFormat;
 		colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
 		// do a glclear
 		colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -1214,7 +1289,7 @@ private:
 
 		VkPipelineDynamicStateCreateInfo dynamicState = {};
 		dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-		dynamicState.dynamicStateCount = 2;
+		dynamicState.dynamicStateCount = (uint32_t)std::size(dynamicStates);
 		dynamicState.pDynamicStates = dynamicStates;
 
 		//--------- FINALIZE THE PIPELINE -----------
@@ -1245,7 +1320,7 @@ private:
 		pipelineInfo.pDynamicState = nullptr; // Optional
 		//pipelineInfo.pDynamicState = &dynamicState;
 		pipelineInfo.layout = pipelineLayout;
-		pipelineInfo.renderPass = renderPass; // pass the vulkan handle (not reference) for render pass
+		pipelineInfo.renderPass = mainRenderPass; // pass the vulkan handle (not reference) for render pass
 		pipelineInfo.subpass = 0;
 		pipelineInfo.basePipelineHandle = VK_NULL_HANDLE; // Optional, for use when creating a new pipeline with an existing one
 		pipelineInfo.basePipelineIndex = -1; // Optional, for use when creating a new pipeline with an existing one
@@ -1530,7 +1605,7 @@ private:
 		createInfo.ppEnabledExtensionNames = deviceExtensions.data();
 
 		if (enableValidationLayers) {
-			createInfo.enabledLayerCount = static_cast<uint32_t>(validationLayers.size());
+			createInfo.enabledLayerCount = (uint32_t)(validationLayers.size());
 			createInfo.ppEnabledLayerNames = validationLayers.data();
 		} else {
 			createInfo.enabledLayerCount = 0;
@@ -1668,6 +1743,7 @@ private:
 		UniformBufferObject ubo;
 		ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));  // model
 		ubo.model = ubo.model * glm::rotate(glm::mat4(1.0f), time * glm::radians(45.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+		//ubo.model = glm::mat4x4(1.0f);
 		ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f)); // world view
 		ubo.proj = glm::perspective(glm::radians(45.0f), swapChainExtent.width / (float)swapChainExtent.height, 0.1f, 10.0f);
 		ubo.proj[1][1] *= -1; // !!!! IN VULKAN FROM OGL, Y AXIS IS FLIPPED !!!!
@@ -1691,11 +1767,11 @@ private:
 			vkDestroyFramebuffer(device, framebuffer, nullptr);
 		}
 
-		vkFreeCommandBuffers(device, commandPool, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
+		vkFreeCommandBuffers(device, commandPool, (uint32_t)(commandBuffers.size()), commandBuffers.data());
 
 		vkDestroyPipeline(device, graphicsPipeline, nullptr);
 		vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
-		vkDestroyRenderPass(device, renderPass, nullptr);
+		vkDestroyRenderPass(device, mainRenderPass, nullptr);
 
 		for (auto imageView : swapChainImageViews) {
 			vkDestroyImageView(device, imageView, nullptr);
